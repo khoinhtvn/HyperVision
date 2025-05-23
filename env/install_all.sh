@@ -25,11 +25,12 @@ apt install libmlpack-dev mlpack-bin libarmadillo-dev -y
 # Install GFlags
 apt install libgflags-dev -y
 
+# Install z3 and other packages
+apt install libz3-dev z3 libensmallen-dev libboost-all-dev
+
 # Install other python libraries
 pip3 install matplotlib scikit-learn
 
 cd env
-chmod +x install_z3.sh
-./install_z3.sh
 chmod +x install_pcapp.sh
 ./install_pcapp.sh

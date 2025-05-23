@@ -28,7 +28,7 @@ sudo ./env/install_all.sh
 
 # Download dataset.
 wget https://www.hypervision.fuchuanpu.xyz/hypervision-dataset.tar.gz
-tar -xxf hypervision-dataset.tar.gz
+tar -xvf hypervision-dataset.tar.gz
 rm $_
 
 # Build and run HyperVision.
