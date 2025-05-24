@@ -18,3 +18,7 @@ target_link_libraries(${PROJECT_NAME}
 )
 
 target_link_libraries(${PROJECT_NAME} z3)
+
+# NEW: Add pthread support for live traffic threading
+find_package(Threads REQUIRED)
+target_link_libraries(${PROJECT_NAME} Threads::Threads)

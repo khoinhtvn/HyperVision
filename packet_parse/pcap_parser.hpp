@@ -73,10 +73,10 @@ public:
     // NEW: Live capture constructor
     explicit pcap_parser(const string & interface_name, bool live_mode);
 
-    // Existing getters (declarations only - implementations in .cpp)
-    auto inline get_raw_packet_vector() const -> const decltype(p_raw_packet);
-    auto inline get_basic_packet_rep() const -> const decltype(p_parse_result);
-    auto inline get_parse_state() -> const decltype(p_parse_state);
+    // Existing getters (FIXED: removed inline keyword to fix linking)
+    auto get_raw_packet_vector() const -> const decltype(p_raw_packet);
+    auto get_basic_packet_rep() const -> const decltype(p_parse_result);
+    auto get_parse_state() -> const decltype(p_parse_state);
 
 private:
     // NEW: Live capture callback
