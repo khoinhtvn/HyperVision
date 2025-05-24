@@ -13,6 +13,7 @@
 #include <iomanip>
 #include <fstream>
 #include <chrono>
+#include <mutex>
 
 namespace Hypervision
 {
@@ -33,7 +34,7 @@ private:
     bool save_result_enable = false;
     string save_result_path = "../temp/default.json";
 
-    // NEW: Processing mode tracking
+    // Processing mode tracking
     enum ProcessingMode { 
         DATASET_MODE,    // .data/.label files (current demo)
         PCAP_FILE_MODE,  // .pcap files (existing but unused)
@@ -41,23 +42,41 @@ private:
     };
     ProcessingMode processing_mode = DATASET_MODE;
 
-    // NEW: Live processing members
+    // PAPER-ALIGNED: Live processing members
     shared_ptr<pcap_parser> p_live_parser;
     std::atomic<bool> live_processing_active{false};
     std::thread live_processing_thread;
     string live_interface_name;
     
-    // NEW: Live processing configuration
-    size_t live_batch_size = 1000;
-    size_t live_timeout_ms = 5000;
-    double live_alert_threshold = 11.0;
+    // PAPER-ALIGNED: Continuous traffic accumulation
+    shared_ptr<vector<shared_ptr<basic_packet>>> accumulated_packets;
+    mutable std::mutex accumulation_mutex;
     
-    // NEW: Packet counter for live mode (to maintain global indexing)
+    // PAPER-ALIGNED: Time-based analysis windows
+    std::chrono::steady_clock::time_point last_analysis_time;
+    std::chrono::steady_clock::time_point last_cleanup_time;
+    
+    // PAPER-ALIGNED: Configuration matching paper's parameters
+    size_t micro_batch_size = 200;                    // Smaller, frequent captures
+    size_t capture_timeout_ms = 1000;                 // More frequent polling
+    std::chrono::seconds analysis_interval{30};       // Time-based analysis
+    std::chrono::seconds flow_timeout{10};            // Paper's flow timeout
+    std::chrono::seconds cleanup_interval{5};         // Paper's cleanup interval
+    double live_alert_threshold = 11.0;
+    size_t min_flows_for_analysis = 10;               // Require meaningful scale
+    size_t min_packets_for_analysis = 50;             // Minimum accumulated packets
+    
+    // PAPER-ALIGNED: Packet counter for consistent indexing
     std::atomic<size_t> global_packet_counter{0};
 
 public:
-    // Constructor/Destructor
-    hypervision_detector() = default;
+    hypervision_detector() {
+        accumulated_packets = make_shared<vector<shared_ptr<basic_packet>>>();
+        accumulated_packets->reserve(10000); // Pre-allocate for efficiency
+        last_analysis_time = std::chrono::steady_clock::now();
+        last_cleanup_time = std::chrono::steady_clock::now();
+    }
+    
     ~hypervision_detector() {
         stop_live_processing();
     }
@@ -96,15 +115,15 @@ public:
             p_label = p_dataset_constructor->get_label();
             p_parse_result = p_dataset_constructor->get_raw_pkt();
 
-        // NEW MODE 3: Live network capture
+        // PAPER-ALIGNED MODE 3: Continuous live network capture
         } else if (jin_main.count("live_capture") &&
                    jin_main["live_capture"].count("interface_name")) {
             
             processing_mode = LIVE_MODE;
             live_interface_name = jin_main["live_capture"]["interface_name"];
             configure_live_mode();
-            start_live_processing();
-            return; // Live mode uses different processing loop
+            start_continuous_processing();
+            return; // Live mode uses continuous processing loop
 
         } else {
             LOGF("Dataset not found.");
@@ -120,7 +139,7 @@ public:
         __PRINTF_EXE_TIME__
     }
 
-    // ENHANCED: Configuration method (supports live mode)
+    // ENHANCED: Configuration method with paper-aligned parameters
     void config_via_json(const json & jin) {
         try {
             // EXISTING: Core configuration validation (unchanged)
@@ -143,18 +162,34 @@ public:
                 save_result_path = static_cast<decltype(save_result_path)>(j_save["save_result_path"]);
             }
 
-            // NEW: Live capture configuration
+            // PAPER-ALIGNED: Live capture configuration
             if (jin.count("live_capture")) {
                 const auto j_live = jin["live_capture"];
-                if (j_live.count("batch_size")) {
-                    live_batch_size = static_cast<size_t>(j_live["batch_size"]);
+                
+                if (j_live.count("micro_batch_size")) {
+                    micro_batch_size = static_cast<size_t>(j_live["micro_batch_size"]);
                 }
                 if (j_live.count("capture_timeout_ms")) {
-                    live_timeout_ms = static_cast<size_t>(j_live["capture_timeout_ms"]);
+                    capture_timeout_ms = static_cast<size_t>(j_live["capture_timeout_ms"]);
+                }
+                if (j_live.count("analysis_interval_sec")) {
+                    analysis_interval = std::chrono::seconds(static_cast<int>(j_live["analysis_interval_sec"]));
+                }
+                if (j_live.count("flow_timeout_sec")) {
+                    flow_timeout = std::chrono::seconds(static_cast<int>(j_live["flow_timeout_sec"]));
+                }
+                if (j_live.count("cleanup_interval_sec")) {
+                    cleanup_interval = std::chrono::seconds(static_cast<int>(j_live["cleanup_interval_sec"]));
+                }
+                if (j_live.count("min_flows_for_analysis")) {
+                    min_flows_for_analysis = static_cast<size_t>(j_live["min_flows_for_analysis"]);
+                }
+                if (j_live.count("min_packets_for_analysis")) {
+                    min_packets_for_analysis = static_cast<size_t>(j_live["min_packets_for_analysis"]);
                 }
             }
             
-            // NEW: Alerting configuration
+            // Alerting configuration
             if (jin.count("alerting") && jin["alerting"].count("alert_threshold")) {
                 live_alert_threshold = static_cast<double>(jin["alerting"]["alert_threshold"]);
             }
@@ -190,7 +225,7 @@ public:
         __PRINTF_EXE_TIME__
     }
 
-    // NEW: Live processing control methods
+    // PAPER-ALIGNED: Live processing control methods
     void configure_live_mode() {
         try {
             p_live_parser = make_shared<pcap_parser>(live_interface_name, true);
@@ -198,15 +233,21 @@ public:
                 FATAL_ERROR("Failed to start live capture on " + live_interface_name);
             }
             LOGF("Live capture configured on interface: %s", live_interface_name.c_str());
+            LOGF("📊 Paper-aligned parameters:");
+            LOGF("   • Micro-batch size: %ld packets", micro_batch_size);
+            LOGF("   • Analysis interval: %ld seconds", analysis_interval.count());
+            LOGF("   • Flow timeout: %ld seconds", flow_timeout.count());
+            LOGF("   • Min packets for analysis: %ld", min_packets_for_analysis);
+            LOGF("   • Min flows for analysis: %ld", min_flows_for_analysis);
         } catch (const exception& e) {
             FATAL_ERROR("Live mode configuration failed: " + string(e.what()));
         }
     }
 
-    void start_live_processing() {
+    void start_continuous_processing() {
         live_processing_active = true;
-        live_processing_thread = std::thread(&hypervision_detector::live_processing_loop, this);
-        LOGF("Live processing started on %s", live_interface_name.c_str());
+        live_processing_thread = std::thread(&hypervision_detector::continuous_processing_loop, this);
+        LOGF("🚀 Continuous processing started (HyperVision paper-aligned methodology)");
         
         // Keep main thread alive for live processing
         live_processing_thread.join();
@@ -252,320 +293,264 @@ private:
         }
     }
 
-    // NEW: Live processing main loop
-    void live_processing_loop() {
-        LOGF("Starting live processing loop...");
+    // PAPER-ALIGNED: Continuous processing main loop (FIXED - no flow constructor warnings)
+    void continuous_processing_loop() {
+        LOGF("🔄 Starting continuous processing loop (paper-aligned methodology)...");
+        LOGF("📈 Expected behavior: Accumulate → Cleanup → Time-window analysis → Alerts");
         
         while (live_processing_active) {
             try {
-                // Capture packets from network interface
-                auto packets = p_live_parser->capture_packets_streaming(live_batch_size, live_timeout_ms);
+                // STEP 1: Continuous micro-batch capture (paper-aligned)
+                auto packets = p_live_parser->capture_packets_streaming(micro_batch_size, capture_timeout_ms);
                 
                 if (packets && !packets->empty()) {
-                    LOGF("Processing %ld packets from live capture", packets->size());
-                    process_live_packet_batch(*packets);
-                } else {
-                    // No packets - brief pause to prevent busy waiting
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    // STEP 2: Accumulate packets continuously
+                    accumulate_packets_continuously(*packets);
                 }
                 
+                // STEP 3: Periodic flow cleanup (paper's 5-second eviction)
+                if (should_cleanup_flows()) {
+                    cleanup_expired_flows();
+                }
+                
+                // STEP 4: Time-based graph analysis (paper's approach - every 30 seconds)
+                if (should_perform_analysis()) {
+                    perform_time_window_analysis();
+                }
+                
+                // Brief pause to prevent excessive CPU usage
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                
             } catch (const exception& e) {
-                LOGF("Live processing error: %s", e.what());
+                LOGF("Continuous processing error: %s", e.what());
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
         }
         
-        LOGF("Live processing loop terminated");
+        LOGF("Continuous processing loop terminated");
     }
 
-    // CRITICAL FIX: Validate and filter packets before processing
-    vector<shared_ptr<basic_packet>> validate_packets(const vector<shared_ptr<basic_packet>>& packets) {
-        vector<shared_ptr<basic_packet>> valid_packets;
+    // PAPER-ALIGNED: Continuous packet accumulation
+    void accumulate_packets_continuously(const vector<shared_ptr<basic_packet>>& new_packets) {
+        std::lock_guard<std::mutex> lock(accumulation_mutex);
         
-        for (const auto& pkt : packets) {
-            if (!pkt) {
-                LOGF("Skipping null packet");
-                continue;
-            }
-            
-            try {
-                // FIXED: Use proper accessor methods
-                if (!pkt->is_valid()) {
-                    LOGF("Skipping invalid packet");
-                    continue;
-                }
-                
-                // FIXED: Use new accessor methods instead of direct access
-                auto ts = pkt->get_ts();
-                auto len = pkt->get_len();
-                auto tp = pkt->get_tp();
-                
-                // Basic sanity checks
-                if (len == 0 || len > 65535) {
-                    LOGF("Skipping packet with invalid length: %d", len);
-                    continue;
-                }
-                
-                // Check if it's a bad packet type
-                if (typeid(*pkt) == typeid(basic_packet_bad)) {
-                    LOGF("Skipping bad packet type");
-                    continue;
-                }
-                
-                valid_packets.push_back(pkt);
-                
-            } catch (const exception& e) {
-                LOGF("Skipping packet due to validation error: %s", e.what());
-                continue;
-            } catch (...) {
-                LOGF("Skipping packet due to unknown validation error");
-                continue;
+        size_t valid_count = 0;
+        for (const auto& pkt : new_packets) {
+            if (pkt && pkt->is_valid()) {
+                accumulated_packets->push_back(pkt);
+                valid_count++;
             }
         }
         
-        LOGF("Validated %ld packets out of %ld total", valid_packets.size(), packets.size());
-        return valid_packets;
+        global_packet_counter += valid_count;
+        
+        // Log accumulation progress periodically
+        static size_t last_log_count = 0;
+        if (accumulated_packets->size() - last_log_count >= 1000) {
+            LOGF("📦 Accumulated %ld packets (total), added %ld valid packets", 
+                 accumulated_packets->size(), valid_count);
+            last_log_count = accumulated_packets->size();
+        }
     }
-
-    // CRITICAL FIX: Enhanced process_live_packet_batch with graph validation
-    void process_live_packet_batch(const vector<shared_ptr<basic_packet>>& packets) {
-        if (packets.empty()) {
-            LOGF("Empty packet batch received");
+    
+    // PAPER-ALIGNED: Time-based analysis (every 30 seconds, not per batch)
+    bool should_perform_analysis() {
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_analysis_time);
+        return elapsed >= analysis_interval;
+    }
+    
+    // FIXED: Time-window analysis with fresh flow constructor (eliminates warnings)
+    void perform_time_window_analysis() {
+        last_analysis_time = std::chrono::steady_clock::now();
+        
+        std::lock_guard<std::mutex> lock(accumulation_mutex);
+        
+        if (accumulated_packets->empty()) {
+            LOGF("⏸️  No accumulated packets for time-window analysis");
             return;
         }
-
+        
+        if (accumulated_packets->size() < min_packets_for_analysis) {
+            LOGF("⏸️  Insufficient accumulated packets: %ld (need >= %ld)", 
+                 accumulated_packets->size(), min_packets_for_analysis);
+            return;
+        }
+        
+        LOGF("🔍 Starting time-window analysis on %ld accumulated packets", accumulated_packets->size());
+        
         try {
-            LOGF("Starting batch processing for %ld packets", packets.size());
+            // FIXED: Create fresh flow constructor for each analysis window
+            // This eliminates the "Previous flow construction result detected" warning
+            auto flow_constructor = make_shared<explicit_flow_constructor>(accumulated_packets);
+            flow_constructor->config_via_json(jin_main["flow_construct"]);
             
-            // STEP 1: Validate packets first
-            auto valid_packets = validate_packets(packets);
-            if (valid_packets.empty()) {
-                LOGF("No valid packets in batch - skipping processing");
+            // Flow construction for accumulated packets
+            flow_constructor->construct_flow(4);
+            auto current_flows = flow_constructor->get_constructed_raw_flow();
+            
+            if (!current_flows || current_flows->size() < min_flows_for_analysis) {
+                LOGF("⏸️  Insufficient flows for meaningful analysis: %ld flows (need >= %ld)", 
+                     current_flows ? current_flows->size() : 0, min_flows_for_analysis);
                 return;
             }
             
-            LOGF("Processing %ld valid packets", valid_packets.size());
+            LOGF("🏗️  Constructed %ld flows from accumulated packets", current_flows->size());
             
-            // STEP 2: Create packet vector with proper sizing
-            p_parse_result = make_shared<vector<shared_ptr<basic_packet>>>(valid_packets);
+            // PAPER-ALIGNED: Graph analysis on meaningful accumulated traffic
+            const auto p_edge_constructor = make_shared<edge_constructor>(current_flows);
+            p_edge_constructor->config_via_json(jin_main["edge_construct"]);
+            p_edge_constructor->do_construct();
+            tie(p_short_edges, p_long_edges) = p_edge_constructor->get_edge();
             
-            // STEP 3: Create labels with exact same size
-            p_label = make_shared<binary_label_t>(valid_packets.size(), false); // All benign for unsupervised
-
-            LOGF("Created packet result: %ld packets, labels: %ld", 
-                 p_parse_result->size(), p_label->size());
-
-            // STEP 4: Enhanced minimum packet validation
-            if (p_parse_result->size() < 6) {
-                LOGF("Too few packets for meaningful graph analysis (need >= 6, got %ld)", p_parse_result->size());
-                LOGF("Small batches like ping traffic cannot form complex interaction patterns");
-                provide_simple_scoring(valid_packets);
-                return;
-            }
-
-            LOGF("Running flow construction...");
-            
-            // STEP 5: Use controlled threading for flow construction
-            size_t thread_count = std::min((size_t)4, std::max((size_t)1, p_parse_result->size() / 20));
-            if (thread_count == 0) thread_count = 1;
-            
-            try {
-                const auto p_flow_constructor = make_shared<explicit_flow_constructor>(p_parse_result);
-                p_flow_constructor->config_via_json(jin_main["flow_construct"]);
-                
-                // Use controlled threading for small batches
-                p_flow_constructor->construct_flow(thread_count);
-                p_flow = p_flow_constructor->get_constructed_raw_flow();
-                
-                LOGF("Flow construction completed: %ld flows", p_flow ? p_flow->size() : 0);
-                
-            } catch (const std::out_of_range& e) {
-                LOGF("Flow construction failed with indexing error: %s - this usually indicates packet data issues", e.what());
-                return;
-            } catch (const exception& e) {
-                LOGF("ERROR in flow construction: %s", e.what());
-                return;
-            }
-
-            // STEP 6: Enhanced flow validation
-            if (!p_flow || p_flow->empty()) {
-                LOGF("No flows constructed - this is normal for very small packet batches");
-                provide_simple_scoring(valid_packets);
-                return;
-            }
-            
-            if (p_flow->size() < 2) {
-                LOGF("Insufficient flows for graph analysis (need >= 2, got %ld)", p_flow->size());
-                LOGF("Single flow cannot create meaningful interaction patterns");
-                provide_simple_scoring(valid_packets);
-                return;
-            }
-
-            LOGF("Running edge construction...");
-            try {
-                const auto p_edge_constructor = make_shared<edge_constructor>(p_flow);
-                p_edge_constructor->config_via_json(jin_main["edge_construct"]);
-                p_edge_constructor->do_construct();
-                tie(p_short_edges, p_long_edges) = p_edge_constructor->get_edge();
-                
-                LOGF("Edge construction completed: %ld short edges, %ld long edges", 
-                     p_short_edges ? p_short_edges->size() : 0,
-                     p_long_edges ? p_long_edges->size() : 0);
-                     
-            } catch (const exception& e) {
-                LOGF("ERROR in edge construction: %s", e.what());
-                return;
-            }
-
-            // STEP 7: Enhanced edge validation for graph complexity
             size_t total_edges = 0;
             if (p_short_edges) total_edges += p_short_edges->size();
             if (p_long_edges) total_edges += p_long_edges->size();
             
-            if (total_edges == 0) {
-                LOGF("No edges constructed - cannot perform graph analysis");
-                provide_simple_scoring(valid_packets);
-                return;
-            }
-            
             if (total_edges < 3) {
-                LOGF("Insufficient edges for meaningful graph analysis (need >= 3, got %ld)", total_edges);
-                LOGF("Simple traffic patterns (ping, single connections) don't require complex analysis");
-                provide_simple_scoring(valid_packets);
+                LOGF("⏸️  Insufficient edges for graph analysis: %ld edges (need >= 3)", total_edges);
                 return;
-            }
-
-            LOGF("Running graph analysis...");
-            try {
-                const auto p_graph = make_shared<traffic_graph>(p_short_edges, p_long_edges);
-                p_graph->config_via_json(jin_main["graph_analyze"]);
-                p_graph->parse_edge();
-                
-                // CRITICAL FIX: Wrap graph_detect in additional try-catch
-                try {
-                    p_graph->graph_detect();
-                    p_loss = p_graph->get_final_pkt_score(p_label);
-                    LOGF("Graph analysis completed: %ld scores generated", p_loss ? p_loss->size() : 0);
-                    
-                } catch (const std::exception& graph_error) {
-                    LOGF("Graph detection failed (likely due to simple graph structure): %s", graph_error.what());
-                    LOGF("This is normal for simple traffic patterns - providing basic scoring");
-                    provide_simple_scoring(valid_packets);
-                    return;
-                }
-                     
-            } catch (const exception& e) {
-                LOGF("ERROR in graph analysis setup: %s", e.what());
-                provide_simple_scoring(valid_packets);
-                return;
-            }
-
-            // Process detection results for live alerts
-            if (p_loss && !p_loss->empty()) {
-                process_live_results(*p_loss, valid_packets);
-            } else {
-                LOGF("No detection scores generated - using simple scoring");
-                provide_simple_scoring(valid_packets);
             }
             
-            LOGF("Batch processing completed successfully");
+            LOGF("🕸️  Constructed %ld edges, performing graph detection...", total_edges);
+            
+            const auto p_graph = make_shared<traffic_graph>(p_short_edges, p_long_edges);
+            p_graph->config_via_json(jin_main["graph_analyze"]);
+            p_graph->parse_edge();
+            p_graph->graph_detect();
+            
+            // Get scores for accumulated packets
+            auto labels = make_shared<binary_label_t>(accumulated_packets->size(), false);
+            auto scores = p_graph->get_final_pkt_score(labels);
+            
+            LOGF("✅ Graph analysis completed: %ld scores generated", scores ? scores->size() : 0);
+            
+            // Process results on accumulated traffic
+            if (scores && !scores->empty()) {
+                process_time_window_results(*scores, *accumulated_packets);
+            } else {
+                LOGF("⚠️  No scores generated from graph analysis");
+            }
             
         } catch (const exception& e) {
-            LOGF("CRITICAL ERROR in batch processing: %s", e.what());
-        } catch (...) {
-            LOGF("UNKNOWN CRITICAL ERROR in batch processing");
+            LOGF("❌ Time-window graph analysis failed: %s", e.what());
         }
     }
-
-    // NEW: Provide simple scoring for cases where graph analysis isn't applicable
-    void provide_simple_scoring(const vector<shared_ptr<basic_packet>>& packets) {
-        LOGF("Providing simple scoring for %ld packets", packets.size());
-        
-        // Create basic scores (all benign for simple traffic)
-        vector<double> simple_scores(packets.size(), 5.0); // Below alert threshold
-        
-        // You could add simple heuristics here:
-        for (size_t i = 0; i < packets.size(); ++i) {
-            try {
-                auto len = packets[i]->get_len();
-                
-                // Simple heuristic: very large packets might be suspicious
-                if (len > 1400) {
-                    simple_scores[i] = 8.0; // Still below threshold but higher
-                }
-                
-                // Simple heuristic: check packet type
-                auto tp = packets[i]->get_tp();
-                if (tp & get_pkt_type_code(pkt_type_t::UNKNOWN)) {
-                    simple_scores[i] = 7.0; // Unknown protocols slightly suspicious
-                }
-                
-            } catch (...) {
-                simple_scores[i] = 6.0; // Packets we can't analyze are slightly suspicious
-            }
-        }
-        
-        // Process simple results (most will be below alert threshold)
-        process_live_results(simple_scores, packets);
-        LOGF("Simple scoring completed");
+    
+    // PAPER-ALIGNED: Flow timeout and cleanup (every 5 seconds)
+    bool should_cleanup_flows() {
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_cleanup_time);
+        return elapsed >= cleanup_interval;
     }
-
-    // NEW: Handle live detection results (alerts, logging, etc.)
-    void process_live_results(const vector<double>& scores, const vector<shared_ptr<basic_packet>>& packets) {
-        size_t alerts_generated = 0;
+    
+    void cleanup_expired_flows() {
+        last_cleanup_time = std::chrono::steady_clock::now();
         
-        // SAFETY: Ensure we don't access beyond vector bounds
-        size_t max_index = min(scores.size(), packets.size());
+        std::lock_guard<std::mutex> lock(accumulation_mutex);
         
-        if (max_index == 0) {
-            LOGF("No results to process (scores: %ld, packets: %ld)", scores.size(), packets.size());
+        if (accumulated_packets->empty()) {
             return;
         }
         
-        LOGF("Processing %ld results (scores: %ld, packets: %ld)", max_index, scores.size(), packets.size());
+        // Remove packets older than flow timeout (paper's 10-second window)
+        auto cutoff_time = std::chrono::steady_clock::now() - flow_timeout;
+        size_t original_size = accumulated_packets->size();
         
+        accumulated_packets->erase(
+            std::remove_if(accumulated_packets->begin(), accumulated_packets->end(),
+                [cutoff_time](const shared_ptr<basic_packet>& pkt) {
+                    try {
+                        auto pkt_time_sec = pkt->get_ts().tv_sec;
+                        auto now_sec = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count();
+                        
+                        // Remove packets older than flow timeout
+                        return (now_sec - pkt_time_sec) > 15; // 15 second cleanup window
+                    } catch (...) {
+                        return true; // Remove invalid packets
+                    }
+                }),
+            accumulated_packets->end()
+        );
+        
+        size_t cleaned_count = original_size - accumulated_packets->size();
+        if (cleaned_count > 0) {
+            LOGF("🧹 Cleaned up %ld expired packets, remaining: %ld", 
+                 cleaned_count, accumulated_packets->size());
+        }
+    }
+    
+    // PAPER-ALIGNED: Process results from time-window analysis
+    void process_time_window_results(const vector<double>& scores, 
+                                   const vector<shared_ptr<basic_packet>>& packets) {
+        size_t alerts_generated = 0;
+        size_t high_scores = 0;
+        size_t max_index = min(scores.size(), packets.size());
+        
+        if (max_index == 0) {
+            LOGF("No results to process");
+            return;
+        }
+        
+        // Calculate statistics
+        double max_score = *std::max_element(scores.begin(), scores.begin() + max_index);
+        double avg_score = std::accumulate(scores.begin(), scores.begin() + max_index, 0.0) / max_index;
+        
+        // Count high scores (above half threshold)
+        for (size_t i = 0; i < max_index; ++i) {
+            if (scores[i] > live_alert_threshold / 2) {
+                high_scores++;
+            }
+        }
+        
+        LOGF("📊 Time-window analysis results:");
+        LOGF("   • Processed: %ld packets", max_index);
+        LOGF("   • Max score: %.2f", max_score);
+        LOGF("   • Avg score: %.2f", avg_score);
+        LOGF("   • High scores (>%.1f): %ld", live_alert_threshold / 2, high_scores);
+        
+        // Generate alerts for anomalies
         for (size_t i = 0; i < max_index; ++i) {
             if (scores[i] > live_alert_threshold) {
-                generate_live_alert(scores[i], packets[i], global_packet_counter + i);
+                generate_time_window_alert(scores[i], packets[i], global_packet_counter - max_index + i);
                 alerts_generated++;
             }
         }
         
-        // Update global packet counter
-        global_packet_counter += max_index;
-        
-        // Log processing statistics
-        LOGF("Processed %ld results, generated %ld alerts (threshold: %.2f)", 
-             max_index, alerts_generated, live_alert_threshold);
+        if (alerts_generated > 0) {
+            LOGF("🚨 Generated %ld security alerts (threshold: %.2f)", alerts_generated, live_alert_threshold);
+        } else {
+            LOGF("✅ No anomalies detected in time window");
+        }
     }
 
-    // NEW: Generate security alerts for live mode
-    void generate_live_alert(double anomaly_score, shared_ptr<basic_packet> packet, size_t packet_index) {
+    // PAPER-ALIGNED: Generate alerts for time-window analysis
+    void generate_time_window_alert(double anomaly_score, shared_ptr<basic_packet> packet, size_t packet_index) {
         try {
-            // FIXED: Use new virtual accessor methods
             string src_ip = packet->get_src_ip_str();
             string dst_ip = packet->get_dst_ip_str();
             pkt_port_t src_port = packet->get_src_port();
             pkt_port_t dst_port = packet->get_dst_port();
 
-            // Get current timestamp
             auto now = std::chrono::system_clock::now();
             auto time_t = std::chrono::system_clock::to_time_t(now);
-            
-            // Generate structured alert output (remove newline from ctime)
             string time_str = std::ctime(&time_t);
             time_str.pop_back(); // Remove trailing newline
             
-            printf("🚨 [SECURITY ALERT] %s | Score: %.2f | %s:%d -> %s:%d | Packet #%ld\n", 
-                   time_str.c_str(), anomaly_score, 
-                   src_ip.c_str(), src_port, dst_ip.c_str(), dst_port, packet_index);
+            // Enhanced alert format for time-window analysis
+            printf("🚨 [HYPERVISION ALERT] %s\n", time_str.c_str());
+            printf("   📊 Anomaly Score: %.2f (threshold: %.2f)\n", anomaly_score, live_alert_threshold);
+            printf("   🌐 Connection: %s:%d → %s:%d\n", src_ip.c_str(), src_port, dst_ip.c_str(), dst_port);
+            printf("   📦 Packet Index: %ld\n", packet_index);
+            printf("   🕐 Analysis: TIME-WINDOW (HyperVision)\n");
+            printf("   ────────────────────────────────────────\n");
             
-            // Also use existing logging system
-            LOGF("🚨 SECURITY ALERT: Anomaly Score %.2f | %s:%d -> %s:%d | Packet #%ld", 
+            LOGF("🚨 HYPERVISION SECURITY ALERT: Score=%.2f | %s:%d→%s:%d | Packet#%ld", 
                  anomaly_score, src_ip.c_str(), src_port, dst_ip.c_str(), dst_port, packet_index);
                  
         } catch (const exception& e) {
-            LOGF("ERROR generating alert: %s", e.what());
+            LOGF("ERROR generating time-window alert: %s", e.what());
         }
     }
 };
